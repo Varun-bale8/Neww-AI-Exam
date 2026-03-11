@@ -31,6 +31,7 @@ urlpatterns = [
     path('round1/start/', views.start_round1, name='start_round1'),
     path('submit_round1/', views.submit_round1, name='submit_round1'),
     path('log_proctoring_event/', views.log_proctoring_event, name='log_proctoring_event'),
+    path('analyze_frame_api/', views.analyze_frame_api, name='analyze_frame_api'),
     
     # Round 2 URLs
     path('round2/intro/', views.round2_intro, name='round2_intro'),

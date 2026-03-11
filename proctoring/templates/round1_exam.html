@@ -208,6 +208,23 @@
             justify-content: center;
             z-index: 9999;
         }
+
+        #proctoring-warning-banner {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #dc3545;
+            color: white;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 1.25rem;
+            font-weight: bold;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+            z-index: 9999;
+            display: none;
+            text-align: center;
+        }
     </style>
 </head>
 
@@ -224,6 +241,12 @@
     <div id="webcam-container">
         <video id="webcam-preview" autoplay playsinline muted></video>
         <div id="cam-status">&#128247; Initializing Camera...</div>
+        <canvas id="proctoring-canvas" style="display: none;"></canvas>
+    </div>
+
+    <!-- Warning Banner -->
+    <div id="proctoring-warning-banner">
+        <span id="warning-text">Suspicious Activity Detected!</span>
     </div>
 
     <!-- 3. Top Navigation Bar -->
@@ -319,7 +342,7 @@
 
         // --- Pagination Logic ---
         let currentQuestionIndex = 0;
-        const totalQuestions = {{ mcqs|length|default:0 }};
+        const totalQuestions = {{ mcqs| length }};
         const mcqIds = [
             {% for mcq in mcqs %}
         "{{ mcq.id }}"{% if not forloop.last %}, {% endif %}
@@ -498,11 +521,11 @@
                         return;
                     }
 
-                    // Request camera access - try simple constraints first
+                    // Request camera and microphone access
                     console.log('Requesting getUserMedia...');
-                    var stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    var stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                     clearTimeout(camTimeout);
-                    console.log('Stream obtained:', stream.getVideoTracks());
+                    console.log('Stream obtained:', stream.getTracks());
 
                     camVideo.srcObject = stream;
 
@@ -512,6 +535,7 @@
                         camVideo.play().then(function () {
                             console.log('Camera playing successfully');
                             setCamOk();
+                            startProctoring(stream, camVideo);
                         }).catch(function (playErr) {
                             console.error('Play failed:', playErr);
                             setCamError('Video play blocked: ' + playErr.message);
@@ -538,6 +562,109 @@
 
             // Also try immediately (in case user already granted permission before)
             initWebcam();
+
+            // --- Proctoring Logic (Video & Audio) ---
+            function startProctoring(stream, videoElement) {
+                const canvas = document.getElementById('proctoring-canvas');
+                const ctx = canvas.getContext('2d');
+                const banner = document.getElementById('proctoring-warning-banner');
+                const warningText = document.getElementById('warning-text');
+
+                let warningTimeout;
+
+                function showWarning(msg) {
+                    warningText.innerText = msg;
+                    banner.style.display = 'block';
+                    clearTimeout(warningTimeout);
+                    warningTimeout = setTimeout(() => { banner.style.display = 'none'; }, 5000);
+                }
+
+                // 1. Audio Proctoring (Detecting loud continuous talking)
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const analyser = audioCtx.createAnalyser();
+                const source = audioCtx.createMediaStreamSource(stream);
+                source.connect(analyser);
+                analyser.fftSize = 256;
+                const bufferLength = analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+
+                let voiceStartTime = null;
+                const VOICE_THRESHOLD = 50; // out of 255; adjust based on environment
+
+                function checkAudio() {
+                    analyser.getByteFrequencyData(dataArray);
+                    let sum = 0;
+                    for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+                    let avgVolume = sum / bufferLength;
+
+                    if (avgVolume > VOICE_THRESHOLD) {
+                        if (!voiceStartTime) voiceStartTime = Date.now();
+                        else if (Date.now() - voiceStartTime > 3000) { // Speaking for >3 seconds
+                            showWarning("ALERT: Voice / Talking Detected!");
+                            logEvent("audio_detected", "Voice detected during exam");
+                            voiceStartTime = null; // Reset
+                        }
+                    } else {
+                        voiceStartTime = null; // Reset if quiet
+                    }
+                    requestAnimationFrame(checkAudio);
+                }
+                checkAudio();
+
+                // 2. Video Proctoring (Polling API every 4 seconds)
+                function getCookie(name) {
+                    let cookieValue = null;
+                    if (document.cookie && document.cookie !== '') {
+                        const cookies = document.cookie.split(';');
+                        for (let i = 0; i < cookies.length; i++) {
+                            const cookie = cookies[i].trim();
+                            if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                                break;
+                            }
+                        }
+                    }
+                    return cookieValue;
+                }
+
+                console.log('[PROCTORING] Starting video polling. SESSION_ID:', SESSION_ID);
+                setInterval(() => {
+                    if (!videoElement.videoWidth) {
+                        console.log('[PROCTORING] Skipping: video not ready yet');
+                        return;
+                    }
+                    canvas.width = videoElement.videoWidth;
+                    canvas.height = videoElement.videoHeight;
+                    ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+                    const base64Image = canvas.toDataURL('image/jpeg', 0.6);
+
+                    console.log('[PROCTORING] Sending frame to API...');
+                    fetch('{% url "analyze_frame_api" %}', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRFToken': getCookie('csrftoken')
+                        },
+                        body: JSON.stringify({
+                            session_id: SESSION_ID,
+                            image: base64Image
+                        })
+                    })
+                        .then(res => {
+                            console.log('[PROCTORING] API response status:', res.status);
+                            return res.json();
+                        })
+                        .then(data => {
+                            console.log('[PROCTORING] API data:', data);
+                            if (data.warning) {
+                                showWarning(data.warning);
+                            }
+                        })
+                        .catch(err => console.error("[PROCTORING] API error:", err));
+                }, 4000);
+            }
+
         })();
 
     </script>

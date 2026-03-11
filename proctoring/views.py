@@ -598,11 +598,7 @@ def exam(request):
     except json.JSONDecodeError:
         return HttpResponse("Error: Failed to parse the questions file!", status=400)
 
-    # Start background processing threads for video and audio monitoring
-    global stop_event
-    stop_event.clear()  # Reset the stop event flag
-    threading.Thread(target=background_processing, args=(request,), daemon=True).start()
-    threading.Thread(target=process_audio, args=(request,), daemon=True).start()
+    # Removed obsolete hardware polling threads that crashed webcams
 
     # Render the exam template with questions and tab count
     # Combine warnings for initial render
@@ -1433,3 +1429,77 @@ Return ONLY valid JSON:
         'passed': session.passed,
     }
     return render(request, 'round2_report.html', context)
+
+import base64
+from django.core.files.base import ContentFile
+
+@csrf_exempt
+@login_required
+def analyze_frame_api(request):
+    """
+    AJAX endpoint for web-native proctoring.
+    Accepts a base64 encoded frame from the frontend, runs it through detectObject,
+    logs cheating events, and returns any warnings.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Invalid method'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        image_data = data.get('image', '')
+        session_id = data.get('session_id')
+
+        if not image_data or not session_id:
+            return JsonResponse({'error': 'Missing image or session_id'}, status=400)
+
+        # Decode base64 frame
+        format, imgstr = image_data.split(';base64,') 
+        ext = format.split('/')[-1]
+        decoded_img = base64.b64decode(imgstr)
+
+        # Convert to numpy array for OpenCV
+        nparr = np.frombuffer(decoded_img, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            return JsonResponse({'error': 'Failed to decode image'}, status=400)
+
+        # Run model inference
+        from .ml_models.object_detection import detectObject
+        labels, processed_frame, person_count, detected_objects = detectObject(frame)
+        
+        current_warning = None
+        session = get_object_or_404(ExamSession, id=session_id)
+        
+        # Check for multiple people
+        if person_count > 1:
+            current_warning = "Multiple persons detected!"
+            cheating_event = CheatingEvent.objects.create(
+                student=request.user.student,
+                cheating_flag=True,
+                event_type="multiple_persons"
+            )
+            if "multiple_persons" not in detected_objects: detected_objects.append("multiple_persons")
+            save_cheating_event(frame, request, cheating_event, detected_objects)
+
+        # Check for objects
+        suspicious_objects = [obj for obj in detected_objects if obj in ["cell phone", "book"]]
+        if suspicious_objects:
+            current_warning = f"{', '.join(suspicious_objects).capitalize()} detected!"
+            cheating_event = CheatingEvent.objects.create(
+                student=request.user.student,
+                cheating_flag=True,
+                event_type="object_detected"
+            )
+            save_cheating_event(frame, request, cheating_event, detected_objects)
+
+        return JsonResponse({
+            'success': True,
+            'warning': current_warning
+        })
+
+    except Exception as e:
+        logger.error(f"Error in analyze_frame_api: {e}")
+        import traceback
+        traceback.print_exc()
+        return JsonResponse({'error': str(e)}, status=500)

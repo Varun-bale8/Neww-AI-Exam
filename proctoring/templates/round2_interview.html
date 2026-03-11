@@ -238,6 +238,9 @@
             <button id="micBtn" disabled title="Hold to speak / click to toggle">🎤</button>
         </div>
         <p class="hint">Click 🎤 to start • Click again (or stop speaking) to submit</p>
+        <button id="endBtn" class="btn btn-outline-danger mt-4 px-4 py-2" style="border-radius: 8px; font-weight: 600;"
+            onclick="if(confirm('Are you sure you want to end the interview early?')) window.location.href=END_URL;">End
+            Interview</button>
     </div>
 
     <script>
